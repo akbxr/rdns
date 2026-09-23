@@ -152,8 +152,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 async fn run_server(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config = if config_path.exists() {
+        Config::load_from_file(&config_path)?
+    } else {
+        Config::default()
+    };
+
+    let default_level = match config.query_log.log_level.to_lowercase().as_str() {
+        "trace" => Level::TRACE,
+        "debug" => Level::DEBUG,
+        "warn" => Level::WARN,
+        "error" => Level::ERROR,
+        _ => Level::INFO,
+    };
+
     let filter = EnvFilter::builder()
-        .with_default_directive(Level::INFO.into())
+        .with_default_directive(default_level.into())
         .from_env_lossy();
 
     tracing_subscriber::fmt()
@@ -162,17 +176,11 @@ async fn run_server(config_path: PathBuf) -> Result<(), Box<dyn std::error::Erro
         .init();
 
     info!("Starting rdns v0.1.0...");
-
-    let config = if config_path.exists() {
-        info!("Loading configuration from {:?}", config_path);
-        Config::load_from_file(&config_path)?
+    if config_path.exists() {
+        info!("Loaded configuration from {:?}", config_path);
     } else {
-        info!(
-            "Configuration file {:?} not found, using default configuration",
-            config_path
-        );
-        Config::default()
-    };
+        info!("Configuration file {:?} not found, using default configuration", config_path);
+    }
 
     let block_engine = Arc::new(BlockEngine::new(config.blocking.clone()));
     let cache = Arc::new(DnsCache::new(config.caching.clone()));

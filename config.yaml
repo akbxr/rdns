@@ -1,59 +1,105 @@
 # ==============================================================================
-# rdns - Minimal, High-Performance DNS Proxy & Ad-Blocker
-# Configuration File
+# rdns - Minimal, High-Performance DNS Proxy & Ad-Blocker in Rust
+# Complete Configuration Reference
 # ==============================================================================
 
+# ------------------------------------------------------------------------------
+# 1. Ports & Network Listeners
+# ------------------------------------------------------------------------------
 ports:
-  # DNS listener port (both UDP and TCP)
-  # Standard port is 53, or use 5335 for non-root / local dev
+  # DNS listener port (UDP and TCP)
+  # - Standard port: "0.0.0.0:53" (requires root/CAP_NET_BIND_SERVICE)
+  # - Non-root development port: "0.0.0.0:5335" or 5335
+  # - Set to null or comment out to disable standard DNS listener
   dns: "0.0.0.0:53"
-  # HTTP API, status, and metrics (also handles plain DoH /dns-query for Caddy/Nginx reverse proxy)
+
+  # HTTP API, DoH (/dns-query), and Prometheus metrics port
+  # - Format: "0.0.0.0:4000" or "127.0.0.1:4000" or 4000
+  # - Handles plain HTTP for Caddy/Nginx reverse proxy or local API commands
   http: "0.0.0.0:4000"
-  # Optional Native HTTPS DoH listener (standard port 443, eliminates need for reverse proxy!)
+
+  # Optional Native HTTPS DoH listener (RFC 8484)
+  # - Standard HTTPS port: "0.0.0.0:443" or 443
+  # - Serves DoH directly over HTTPS at /dns-query without reverse proxy
+  # - Requires tls.cert and tls.key below
+  # - Default: null (disabled)
   # https: "0.0.0.0:443"
-  # Optional Native DoT (DNS-over-TLS) listener for Android Private DNS (standard port 853)
+
+  # Optional Native DoT (DNS-over-TLS) listener (RFC 7858)
+  # - Standard DoT port: "0.0.0.0:853" or 853
+  # - Direct TLS termination for Android Private DNS and iOS DoT profiles
+  # - Requires tls.cert and tls.key below
+  # - Default: null (disabled)
   # dot: "0.0.0.0:853"
-# TLS Certificates (required only if ports.https or ports.dot is enabled)
+
+# TLS Certificates (Required only if ports.https or ports.dot is enabled)
 # tls:
-#   cert: "/etc/letsencrypt/live/dns.yourdomain.com/fullchain.pem"
-#   key: "/etc/letsencrypt/live/dns.yourdomain.com/privkey.pem"
+#   # Path to PEM-encoded certificate chain (fullchain.pem or .crt)
+#   cert: "/etc/letsencrypt/live/dns.example.com/fullchain.pem"
+#   # Path to PEM-encoded private key (privkey.pem or .key)
+#   key: "/etc/letsencrypt/live/dns.example.com/privkey.pem"
+
+# ------------------------------------------------------------------------------
+# 2. Upstream Resolvers & Query Routing
+# ------------------------------------------------------------------------------
 upstreams:
+  # Upstream groups. The "default" group is mandatory and handles general traffic.
+  # Supported prefix formats:
+  #   - udp:<ip>:<port> or <ip>:<port> or <ip>  (plain UDP, default port 53)
+  #   - tcp:<ip>:<port>                         (plain TCP, default port 53)
+  #   - dot:<hostname>:<port>                   (DNS-over-TLS, default port 853)
+  #   - dot:<ip>:<port>#<sni_hostname>          (DoT with custom SNI hostname)
+  #   - https://<url> or doh:https://<url>      (DNS-over-HTTPS via HTTP POST/GET)
   groups:
-    # Default upstream group (combining Cloudflare & Google for ultra-fast parallel resolution)
     default:
-      # Cloudflare DNS (UDP, TCP, DoT, DoH)
+      # Cloudflare DNS
       - "udp:1.1.1.1:53"
       - "tcp:1.0.0.1:53"
       - "dot:cloudflare-dns.com:853"
       - "https://cloudflare-dns.com/dns-query"
-      # Google DNS (UDP, TCP, DoT, DoH)
+      # Google DNS
       - "udp:8.8.8.8:53"
       - "tcp:8.8.4.4:53"
       - "dot:dns.google:853"
       - "https://dns.google/dns-query"
-    # Quad9 security group
-    quad9:
+
+    # Optional secondary/custom group (can be referenced in conditional mapping)
+    security:
       - "https://dns.quad9.net/dns-query"
       - "udp:9.9.9.9:53"
-  # Strategy for upstream querying:
-  # - parallel: race all upstreams simultaneously, fastest valid response wins (lowest latency)
-  # - strict: try upstreams in sequential order until one succeeds
-  # - random: pick upstreams randomly
+
+  # Upstream query strategy:
+  # - parallel: queries all upstreams concurrently, fastest valid response wins (lowest latency, default)
+  # - strict:   tries upstreams in sequential order until one succeeds (failover)
+  # - random:   shuffles upstreams randomly before querying
   strategy: parallel
 
-  # Timeout per query attempt
+  # Timeout per query attempt.
+  # Supported duration units: s (seconds), m (minutes), h (hours), d (days), or integer seconds.
   timeout: 2s
 
-# Conditional forwarding (route specific domains to dedicated upstream servers)
+# Conditional forwarding (route specific domains to dedicated upstream servers/routers)
 conditional:
+  # Format: "domain_suffix": "upstream_group_or_address"
   mapping:
     "home.lan": "udp:192.168.1.1:53"
     "168.192.in-addr.arpa": "udp:192.168.1.1:53"
 
-# Ad-blocking and domain filtering engine
+# ------------------------------------------------------------------------------
+# 3. Ad-Blocking & Content Filtering
+# ------------------------------------------------------------------------------
 blocking:
+  # Master switch for ad-blocking
+  # Options: true | false (default: true)
+  enabled: true
+
   # Named blacklist sources (URLs or local file paths)
-  # Supported formats: Hosts file, Adblock Plus (||domain^), /regex/, and plain domain lists
+  # Supported file formats:
+  #   - Hosts file format: "0.0.0.0 ad.example.com" or "127.0.0.1 ad.example.com"
+  #   - Adblock Plus / ABP format: "||doubleclick.net^"
+  #   - Regular expressions: "/^ad[0-9]*\..*$/"
+  #   - Plain domain lists: "ad.example.com"
+  #   - Gzip compressed lists: ending in ".gz" are automatically decompressed
   blacklists:
     ads:
       - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
@@ -61,12 +107,13 @@ blocking:
     malware:
       - "https://urlhaus.abuse.ch/downloads/hostfile/"
 
-  # Named whitelist sources (exact domains or regex patterns that bypass blocking)
+  # Named whitelist sources (domains or regexes that bypass blacklists)
   whitelists:
     ads:
       - "analytics.google.com"
 
   # Map client groups to blacklist categories
+  # Clients belong to the "default" group unless mapped in client_lookup below
   client_groups:
     default:
       - "ads"
@@ -74,60 +121,90 @@ blocking:
       - "ads"
       - "malware"
 
-  # Block response type:
-  # - zeroIp: returns 0.0.0.0 for A, :: for AAAA (default, fast and clean)
-  # - nxdomain: returns standard NXDOMAIN response code
-  # - customIp: returns specified custom IPv4 and IPv6
+  # Response sent to client when a domain is blocked:
+  # - zeroIp:   returns 0.0.0.0 for A queries, :: for AAAA queries, NODATA for others (default, recommended)
+  # - nxdomain: returns standard DNS NXDOMAIN response code
+  # - customIp: returns specified custom IPv4 and IPv6 addresses below
   block_type: zeroIp
 
-  # Optional custom IP if block_type is customIp
+  # Custom IPs returned when block_type is set to "customIp"
   custom_ip:
     ipv4: "0.0.0.0"
     ipv6: "::"
 
   # TTL returned to clients for blocked queries
+  # Units: s, m, h, d, or raw seconds (default: 1h)
   block_ttl: 1h
 
-  # Background refresh period for re-downloading blocklists
+  # Periodic background refresh interval for re-downloading all blocklists
+  # Units: s, m, h, d, or 0 to disable background refresh (default: 4h)
   refresh_period: 4h
 
-  # Download settings
+  # HTTP download settings for fetching blocklists
   download_timeout: 30s
   download_attempts: 3
   download_cooldown: 2s
-  enabled: true
 
-# Client identification and grouping
+# ------------------------------------------------------------------------------
+# 4. Client Identification & Group Mapping
+# ------------------------------------------------------------------------------
 client_lookup:
+  # Map client IP addresses or CIDR subnets to client groups.
+  # The most specific match takes precedence (/32 or /128 beats /24, which beats /16).
+  # Unmatched clients fall back to the "default" group.
   clients:
-    # Exact IP address
+    # Exact IP address (e.g. kid's tablet)
     "192.168.1.100":
       - "kids"
-    # CIDR subnet
+    # CIDR subnet (e.g. local home network)
     "192.168.1.0/24":
       - "default"
 
-# In-memory DNS response caching
+# ------------------------------------------------------------------------------
+# 5. In-Memory DNS Response Caching
+# ------------------------------------------------------------------------------
 caching:
-  # Minimum TTL clamp (ensures frequently accessed domains are cached reasonably)
-  min_ttl: 5m
-  # Maximum TTL clamp (prevents stale records from living forever)
-  max_ttl: 1d
-  # Negative caching TTL for NXDOMAIN and NODATA
-  neg_ttl: 30m
-  # Prefetching: automatically refresh popular domains before they expire
-  prefetching: true
-  # Number of queries required to trigger prefetch
-  prefetch_threshold: 5
-  # Maximum entries in cache
-  max_items: 50000
+  # Master switch for DNS cache
+  # Options: true | false (default: true)
   enabled: true
 
-# Custom DNS records and local hostname resolution
+  # Minimum TTL clamp (ensures frequently accessed domains are cached reasonably)
+  # Upstream TTLs lower than this are clamped up to min_ttl (default: 5m)
+  min_ttl: 5m
+
+  # Maximum TTL clamp (prevents stale records from living in cache forever)
+  # Upstream TTLs higher than this are clamped down to max_ttl (default: 1d)
+  max_ttl: 1d
+
+  # Negative caching TTL for NXDOMAIN and empty NODATA responses (default: 30m)
+  neg_ttl: 30m
+
+  # Prefetching: automatically refresh popular domains before their TTL expires
+  # Options: true | false (default: true)
+  prefetching: true
+
+  # Number of queries required to qualify a domain for background prefetching (default: 5)
+  prefetch_threshold: 5
+
+  # Maximum time window for prefetch consideration (default: 2h)
+  prefetch_expires: 2h
+
+  # Maximum number of entries kept in memory before evicting expired/oldest (default: 50000)
+  max_items: 50000
+
+# ------------------------------------------------------------------------------
+# 6. Custom DNS Records & Local Hostname Resolution
+# ------------------------------------------------------------------------------
 custom_dns:
+  # TTL returned for custom DNS answers (default: 1h)
   custom_ttl: 1h
+
+  # Local mappings. Supported target types:
+  #   - IPv4 address: creates A record + automatically generates reverse PTR record!
+  #   - IPv6 address: creates AAAA record + automatically generates reverse PTR record!
+  #   - Domain name:  creates CNAME record (aliases)
   mapping:
-    # A and AAAA records (reverse PTR is automatically generated!)
+    # A and AAAA records (reverse PTR 1.1.168.192.in-addr.arpa is generated automatically)
     "router.home.lan":
       - "192.168.1.1"
     "nas.home.lan":
@@ -137,17 +214,31 @@ custom_dns:
     "storage.home.lan":
       - "nas.home.lan"
 
-# Query logging
+# ------------------------------------------------------------------------------
+# 7. Query Logging & Privacy Auditing
+# ------------------------------------------------------------------------------
 query_log:
   # Logging mode:
-  # - console: Real-time query log printed to terminal/stdout
-  # - csv-client: Privacy-focused daily query aggregation per client in CSV format
-  #               (only logs query count per client per day, NEVER logs hostnames/domains!)
-  # - none: Disables query logging
+  #   - console:    Prints real-time structured query log to terminal / Docker logs (default)
+  #   - csv-client: Aggregates daily query counts per client in CSV files without logging hostnames (privacy-focused)
+  #   - none:       Disables query logging completely
   type: console
+
+  # Log verbosity level for application and query logs:
+  # Options:
+  #   - trace: Extremely verbose (logs all internal network events)
+  #   - debug: Detailed debugging information
+  #   - info:  Standard operational messages and query logs (default, recommended)
+  #   - warn:  Warnings and recoverable errors only
+  #   - error: Errors only
   log_level: info
+
+  # Whether to log blocked queries
+  # Options: true | false (default: true)
   log_blocked: true
-  # Directory where per-client daily CSV files are stored (when type is csv-client)
+
+  # Directory path where daily per-client CSV files are saved (when type is "csv-client")
   target_dir: "./logs"
-  # How often in-memory aggregated query counts are flushed to disk
+
+  # How often in-memory aggregated query counts are flushed to disk (when type is "csv-client")
   flush_interval: 30s
