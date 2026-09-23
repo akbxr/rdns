@@ -1,0 +1,153 @@
+# ==============================================================================
+# rdns - Minimal, High-Performance DNS Proxy & Ad-Blocker
+# Configuration File
+# ==============================================================================
+
+ports:
+  # DNS listener port (both UDP and TCP)
+  # Standard port is 53, or use 5335 for non-root / local dev
+  dns: "0.0.0.0:53"
+  # HTTP API, status, and metrics (also handles plain DoH /dns-query for Caddy/Nginx reverse proxy)
+  http: "0.0.0.0:4000"
+  # Optional Native HTTPS DoH listener (standard port 443, eliminates need for reverse proxy!)
+  # https: "0.0.0.0:443"
+  # Optional Native DoT (DNS-over-TLS) listener for Android Private DNS (standard port 853)
+  # dot: "0.0.0.0:853"
+# TLS Certificates (required only if ports.https or ports.dot is enabled)
+# tls:
+#   cert: "/etc/letsencrypt/live/dns.yourdomain.com/fullchain.pem"
+#   key: "/etc/letsencrypt/live/dns.yourdomain.com/privkey.pem"
+upstreams:
+  groups:
+    # Default upstream group (combining Cloudflare & Google for ultra-fast parallel resolution)
+    default:
+      # Cloudflare DNS (UDP, TCP, DoT, DoH)
+      - "udp:1.1.1.1:53"
+      - "tcp:1.0.0.1:53"
+      - "dot:cloudflare-dns.com:853"
+      - "https://cloudflare-dns.com/dns-query"
+      # Google DNS (UDP, TCP, DoT, DoH)
+      - "udp:8.8.8.8:53"
+      - "tcp:8.8.4.4:53"
+      - "dot:dns.google:853"
+      - "https://dns.google/dns-query"
+    # Quad9 security group
+    quad9:
+      - "https://dns.quad9.net/dns-query"
+      - "udp:9.9.9.9:53"
+  # Strategy for upstream querying:
+  # - parallel: race all upstreams simultaneously, fastest valid response wins (lowest latency)
+  # - strict: try upstreams in sequential order until one succeeds
+  # - random: pick upstreams randomly
+  strategy: parallel
+
+  # Timeout per query attempt
+  timeout: 2s
+
+# Conditional forwarding (route specific domains to dedicated upstream servers)
+conditional:
+  mapping:
+    "home.lan": "udp:192.168.1.1:53"
+    "168.192.in-addr.arpa": "udp:192.168.1.1:53"
+
+# Ad-blocking and domain filtering engine
+blocking:
+  # Named blacklist sources (URLs or local file paths)
+  # Supported formats: Hosts file, Adblock Plus (||domain^), /regex/, and plain domain lists
+  blacklists:
+    ads:
+      - "https://raw.githubusercontent.com/StevenBlack/hosts/master/hosts"
+      - "https://adaway.org/hosts.txt"
+    malware:
+      - "https://urlhaus.abuse.ch/downloads/hostfile/"
+
+  # Named whitelist sources (exact domains or regex patterns that bypass blocking)
+  whitelists:
+    ads:
+      - "analytics.google.com"
+
+  # Map client groups to blacklist categories
+  client_groups:
+    default:
+      - "ads"
+    kids:
+      - "ads"
+      - "malware"
+
+  # Block response type:
+  # - zeroIp: returns 0.0.0.0 for A, :: for AAAA (default, fast and clean)
+  # - nxdomain: returns standard NXDOMAIN response code
+  # - customIp: returns specified custom IPv4 and IPv6
+  block_type: zeroIp
+
+  # Optional custom IP if block_type is customIp
+  custom_ip:
+    ipv4: "0.0.0.0"
+    ipv6: "::"
+
+  # TTL returned to clients for blocked queries
+  block_ttl: 1h
+
+  # Background refresh period for re-downloading blocklists
+  refresh_period: 4h
+
+  # Download settings
+  download_timeout: 30s
+  download_attempts: 3
+  download_cooldown: 2s
+  enabled: true
+
+# Client identification and grouping
+client_lookup:
+  clients:
+    # Exact IP address
+    "192.168.1.100":
+      - "kids"
+    # CIDR subnet
+    "192.168.1.0/24":
+      - "default"
+
+# In-memory DNS response caching
+caching:
+  # Minimum TTL clamp (ensures frequently accessed domains are cached reasonably)
+  min_ttl: 5m
+  # Maximum TTL clamp (prevents stale records from living forever)
+  max_ttl: 1d
+  # Negative caching TTL for NXDOMAIN and NODATA
+  neg_ttl: 30m
+  # Prefetching: automatically refresh popular domains before they expire
+  prefetching: true
+  # Number of queries required to trigger prefetch
+  prefetch_threshold: 5
+  # Maximum entries in cache
+  max_items: 50000
+  enabled: true
+
+# Custom DNS records and local hostname resolution
+custom_dns:
+  custom_ttl: 1h
+  mapping:
+    # A and AAAA records (reverse PTR is automatically generated!)
+    "router.home.lan":
+      - "192.168.1.1"
+    "nas.home.lan":
+      - "192.168.1.10"
+      - "fd00::10"
+    # CNAME alias
+    "storage.home.lan":
+      - "nas.home.lan"
+
+# Query logging
+query_log:
+  # Logging mode:
+  # - console: Real-time query log printed to terminal/stdout
+  # - csv-client: Privacy-focused daily query aggregation per client in CSV format
+  #               (only logs query count per client per day, NEVER logs hostnames/domains!)
+  # - none: Disables query logging
+  type: console
+  log_level: info
+  log_blocked: true
+  # Directory where per-client daily CSV files are stored (when type is csv-client)
+  target_dir: "./logs"
+  # How often in-memory aggregated query counts are flushed to disk
+  flush_interval: 30s

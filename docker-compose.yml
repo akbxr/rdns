@@ -1,0 +1,30 @@
+services:
+  rdns:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rdns:latest
+    container_name: rdns
+    restart: unless-stopped
+    ports:
+      # Port 53 DNS (UDP & TCP)
+      - "53:53/udp"
+      - "53:53/tcp"
+      # Port 853 DoT (optional)
+      # - "853:853/tcp"
+      # Port 443 Native HTTPS DoH (optional)
+      # - "443:443/tcp"
+      # Port 4000 HTTP API, DoH & Metrics
+      - "4000:4000/tcp"
+    volumes:
+      # Mount configuration file
+      - ./config.yaml:/app/config.yaml:ro
+      # Mount logs directory for daily CSV queries (privacy-focused)
+      - ./logs:/app/logs
+      # Mount TLS certificates if DoT / Native HTTPS enabled
+      # - /etc/letsencrypt:/etc/letsencrypt:ro
+    # Optional resource constraints
+    deploy:
+      resources:
+        limits:
+          memory: 64M

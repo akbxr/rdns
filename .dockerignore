@@ -1,0 +1,5 @@
+target/
+.git/
+logs/
+test_csv_logs/
+*.pid
