@@ -281,8 +281,13 @@ impl BlockEngine {
             new_whitelists.insert(group.clone(), parsed_group);
         }
 
-        *self.blacklists.write() = new_blacklists;
-        *self.whitelists.write() = new_whitelists;
+        // Swap under the lock but free the old lists after releasing it: DNS lookups take
+        // the read lock, and freeing millions of entries while holding the write lock
+        // stalled them.
+        let old_blacklists = std::mem::replace(&mut *self.blacklists.write(), new_blacklists);
+        let old_whitelists = std::mem::replace(&mut *self.whitelists.write(), new_whitelists);
+        drop(old_blacklists);
+        drop(old_whitelists);
         self.total_blocked_rules.store(total_rules, Ordering::Relaxed);
 
         info!(total_rules = total_rules, "Blocklists and whitelists successfully updated");

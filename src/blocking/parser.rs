@@ -1,14 +1,86 @@
 use flate2::read::GzDecoder;
 use regex::Regex;
-use std::collections::HashSet;
+use std::borrow::Cow;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 use tracing::{debug, warn};
 
+/// Set of domain names stored as sorted, deduplicated 64-bit hashes.
+///
+/// Blocklists hold millions of domains; a `HashSet<String>` costs about 100 bytes per
+/// domain, which on a 1 GB server (and twice that while a refresh builds the new lists)
+/// pushed the host into swap. A hash costs 8 bytes. The chance that a domain not on a
+/// list matches one that is, with 5 million entries, is about 3 in 10^13 per lookup.
+#[derive(Debug, Default, Clone)]
+pub struct DomainSet {
+    hashes: Vec<u64>,
+}
+
+impl DomainSet {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Builds a set from unsorted hashes that may contain duplicates.
+    fn from_hashes(mut hashes: Vec<u64>) -> Self {
+        hashes.sort_unstable();
+        hashes.dedup();
+        hashes.shrink_to_fit();
+        Self { hashes }
+    }
+
+    /// Adds a domain, which is expected to be normalized already. Returns false when it
+    /// was present. Inserting keeps the set sorted, so it is O(n): use it for a few
+    /// entries; lists are built in bulk by `ListParser`.
+    pub fn insert(&mut self, domain: impl AsRef<str>) -> bool {
+        let hash = domain_hash(domain.as_ref());
+        match self.hashes.binary_search(&hash) {
+            Ok(_) => false,
+            Err(index) => {
+                self.hashes.insert(index, hash);
+                true
+            }
+        }
+    }
+
+    pub fn contains(&self, domain: &str) -> bool {
+        self.hashes.binary_search(&domain_hash(domain)).is_ok()
+    }
+
+    pub fn len(&self) -> usize {
+        self.hashes.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.hashes.is_empty()
+    }
+
+    pub fn extend(&mut self, other: DomainSet) {
+        if self.hashes.is_empty() {
+            self.hashes = other.hashes;
+            return;
+        }
+        let mut hashes = std::mem::take(&mut self.hashes);
+        hashes.reserve_exact(other.hashes.len());
+        hashes.extend_from_slice(&other.hashes);
+        drop(other);
+        *self = Self::from_hashes(hashes);
+    }
+}
+
+/// Hash of a normalized domain. `DefaultHasher::new()` uses fixed keys, so the same
+/// domain always gives the same hash within a build.
+fn domain_hash(domain: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    domain.hash(&mut hasher);
+    hasher.finish()
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ParsedList {
-    pub domains: HashSet<String>,
+    pub domains: DomainSet,
     pub regexes: Vec<Regex>,
 }
 
@@ -36,7 +108,8 @@ pub struct ListParser;
 impl ListParser {
     /// Parse lines of text from any supported format into `ParsedList`
     pub fn parse_content(content: &str) -> ParsedList {
-        let mut result = ParsedList::new();
+        let mut regexes = Vec::new();
+        let mut hashes = Vec::new();
 
         for line in content.lines() {
             let line = line.trim();
@@ -54,7 +127,7 @@ impl ListParser {
                 if let Some(pattern) = line.strip_prefix('/').and_then(|s| s.strip_suffix('/')) {
                     match Regex::new(pattern) {
                         Ok(re) => {
-                            result.regexes.push(re);
+                            regexes.push(re);
                             continue;
                         }
                         Err(e) => {
@@ -73,7 +146,7 @@ impl ListParser {
                     .unwrap_or("")
                     .trim();
                 if let Some(norm) = normalize_domain(domain_part) {
-                    result.domains.insert(norm);
+                    hashes.push(domain_hash(&norm));
                 }
                 continue;
             }
@@ -104,19 +177,22 @@ impl ListParser {
                             && norm != "ip6-localhost"
                             && norm != "ip6-loopback"
                         {
-                            result.domains.insert(norm);
+                            hashes.push(domain_hash(&norm));
                         }
                     }
                 }
             } else {
                 // Plain domain list or single domain
                 if let Some(norm) = normalize_domain(tokens[0]) {
-                    result.domains.insert(norm);
+                    hashes.push(domain_hash(&norm));
                 }
             }
         }
 
-        result
+        ParsedList {
+            domains: DomainSet::from_hashes(hashes),
+            regexes,
+        }
     }
 
     /// Load list from URL, local file, or direct inline string
@@ -144,8 +220,11 @@ impl ListParser {
                         } else {
                             match resp.bytes().await {
                                 Ok(bytes) => {
-                                    let content = decode_bytes(&bytes, source)?;
-                                    return Ok(Self::parse_content(&content));
+                                    let parsed = {
+                                        let content = decode_bytes(&bytes, source)?;
+                                        Self::parse_content(&content)
+                                    };
+                                    return Ok(parsed);
                                 }
                                 Err(e) => last_err = format!("Failed to read response body: {e}"),
                             }
@@ -181,7 +260,9 @@ impl ListParser {
     }
 }
 
-fn decode_bytes(bytes: &[u8], source_hint: &str) -> Result<String, String> {
+/// Decodes a downloaded list. Valid UTF-8 is borrowed rather than copied: the largest
+/// lists are tens of megabytes.
+fn decode_bytes<'a>(bytes: &'a [u8], source_hint: &str) -> Result<Cow<'a, str>, String> {
     // Check if gzipped (magic bytes: 0x1f, 0x8b or .gz extension)
     let is_gzip = source_hint.ends_with(".gz") || (bytes.len() >= 2 && bytes[0] == 0x1f && bytes[1] == 0x8b);
 
@@ -191,9 +272,9 @@ fn decode_bytes(bytes: &[u8], source_hint: &str) -> Result<String, String> {
         decoder
             .read_to_string(&mut decompressed)
             .map_err(|e| format!("Gzip decompression failed for '{source_hint}': {e}"))?;
-        Ok(decompressed)
+        Ok(Cow::Owned(decompressed))
     } else {
-        Ok(String::from_utf8_lossy(bytes).into_owned())
+        Ok(String::from_utf8_lossy(bytes))
     }
 }
 
@@ -261,5 +342,39 @@ adservice.google.com
         let parsed = ListParser::parse_content(content);
         assert!(parsed.domains.contains("adservice.google.com"));
         assert_eq!(parsed.regexes.len(), 2);
+    }
+
+    #[test]
+    fn test_domain_set_dedup_merge_and_lookup() {
+        let parsed = ListParser::parse_content("a.example.com\nb.example.com\nA.Example.com.\n");
+        assert_eq!(parsed.domains.len(), 2);
+
+        let mut set = DomainSet::new();
+        assert!(set.insert("c.example.com"));
+        assert!(!set.insert("c.example.com"));
+        set.extend(parsed.domains);
+        assert_eq!(set.len(), 3);
+        for domain in ["a.example.com", "b.example.com", "c.example.com"] {
+            assert!(set.contains(domain), "{domain} missing");
+        }
+        assert!(!set.contains("example.com"));
+        assert!(!set.contains("d.example.com"));
+
+        let mut empty = DomainSet::new();
+        empty.extend(set.clone());
+        assert_eq!(empty.len(), 3);
+    }
+
+    #[test]
+    fn test_domain_set_large_list_has_no_false_matches() {
+        let content: String = (0..200_000)
+            .map(|i| format!("host{i}.blocked.test\n"))
+            .collect();
+        let parsed = ListParser::parse_content(&content);
+        assert_eq!(parsed.domains.len(), 200_000);
+        assert!((0..200_000)
+            .step_by(997)
+            .all(|i| parsed.domains.contains(&format!("host{i}.blocked.test"))));
+        assert!((0..200_000).all(|i| !parsed.domains.contains(&format!("host{i}.allowed.test"))));
     }
 }
