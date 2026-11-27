@@ -35,12 +35,15 @@ impl DohResolver {
         let bytes = query
             .to_vec()
             .map_err(|e| format!("Failed to serialize query: {e}"))?;
+        self.resolve_wire(&bytes, query.metadata.id, query_timeout).await
+    }
 
+    pub(crate) async fn resolve_wire(&self, bytes: &[u8], id: u16, query_timeout: Duration) -> Result<Message, String> {
         timeout(query_timeout, async {
             let res = self
                 .client
                 .post(&self.url)
-                .body(bytes)
+                .body(bytes.to_vec())
                 .send()
                 .await
                 .map_err(|e| format!("DoH HTTP request to {} failed: {e}", self.url))?;
@@ -62,8 +65,8 @@ impl DohResolver {
                 .map_err(|e| format!("Failed to parse DoH DNS response: {e}"))?;
 
             // In DoH, ID may sometimes be set to 0 by resolvers; fix it to match query if needed
-            if resp.metadata.id != query.metadata.id {
-                resp.metadata.id = query.metadata.id;
+            if resp.metadata.id != id {
+                resp.metadata.id = id;
             }
 
             Ok(resp)

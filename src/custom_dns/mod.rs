@@ -36,7 +36,7 @@ impl CustomDnsManager {
         let mut auto_ptrs: Vec<(String, String)> = Vec::new();
 
         for (domain, targets) in &config.mapping {
-            let norm_domain = domain.trim().trim_end_matches('.').to_lowercase();
+            let norm_domain = normalize_config_domain(domain);
             let entry = records.entry(norm_domain.clone()).or_default();
 
             for target in targets {
@@ -54,7 +54,7 @@ impl CustomDnsManager {
                     }
                 } else {
                     // CNAME target or explicit PTR target
-                    let norm_target = target.trim_end_matches('.').to_lowercase();
+                    let norm_target = normalize_config_domain(target);
                     if norm_domain.ends_with(".in-addr.arpa") || norm_domain.ends_with(".ip6.arpa") {
                         entry.ptrs.push(norm_target);
                     } else {
@@ -78,11 +78,25 @@ impl CustomDnsManager {
     /// Try to answer query from custom DNS records.
     /// Returns Some(Message) if record matched (even if NODATA), or None if domain not in custom DNS.
     pub fn resolve(&self, query: &Message) -> Option<Message> {
+        if self.records.is_empty() {
+            return None;
+        }
         let question = query.queries.first()?;
-        let query_name_str = question.name.to_utf8();
-        let norm_domain = query_name_str.trim().trim_end_matches('.').to_lowercase();
+        let mut domain = question.name.to_ascii();
+        if domain.ends_with('.') {
+            domain.pop();
+        }
+        domain.make_ascii_lowercase();
+        self.resolve_domain(query, &domain)
+    }
 
-        let record = self.records.get(&norm_domain)?;
+    /// Like `resolve`, with the query name already normalized (lowercase ASCII, no root dot).
+    pub fn resolve_domain(&self, query: &Message, norm_domain: &str) -> Option<Message> {
+        if self.records.is_empty() {
+            return None;
+        }
+        let question = query.queries.first()?;
+        let record = self.records.get(norm_domain)?;
 
         let mut resp = Message::new(query.metadata.id, MessageType::Response, OpCode::Query);
         resp.metadata.recursion_desired = query.metadata.recursion_desired;
@@ -184,6 +198,21 @@ impl CustomDnsManager {
             }
         }
     }
+}
+
+/// Lowercase, without the root dot, internationalized names in punycode: the form
+/// query names are matched in.
+fn normalize_config_domain(domain: &str) -> String {
+    let trimmed = domain.trim().trim_end_matches('.');
+    let mut norm = if trimmed.is_ascii() {
+        trimmed.to_string()
+    } else {
+        Name::from_utf8(trimmed)
+            .map(|name| name.to_ascii().trim_end_matches('.').to_string())
+            .unwrap_or_else(|_| trimmed.to_string())
+    };
+    norm.make_ascii_lowercase();
+    norm
 }
 
 pub fn ipv4_to_ptr_name(ip: Ipv4Addr) -> String {

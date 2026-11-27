@@ -20,7 +20,8 @@ A minimal DNS proxy and ad blocker written in Rust, inspired by [Blocky](https:/
 
 - Parses hosts files, Adblock Plus rules, regular expressions, and raw domain lists.
 - Decompresses `.gz` lists during download.
-- Suffix matching walks domain labels from right to left without heap allocation per query. Blocking `doubleclick.net` catches `ad.doubleclick.net` automatically.
+- Parses lists while they download, so a 100 MB list is never held in memory. Domains are kept as 64-bit hashes, about 6 bytes per domain for large lists (7 million domains take about 40 MB).
+- Suffix matching walks domain labels from right to left without heap allocation per query. Blocking `doubleclick.net` catches `ad.doubleclick.net` automatically. Internationalized names match in punycode (`xn--...`) or Unicode form.
 - Whitelists take precedence over blacklists.
 - Client groups let you give different rules to different subnets or individual IPs.
 - Blocks answer with `0.0.0.0` and `::`, NXDOMAIN, or a custom IP.
@@ -28,7 +29,7 @@ A minimal DNS proxy and ad blocker written in Rust, inspired by [Blocky](https:/
 
 ### Cache
 
-- In-memory cache using read-write locks.
+- In-memory cache that stores responses in DNS wire format (about 300 bytes per entry).
 - Enforces minimum and maximum TTL bounds on upstream responses.
 - Caches NXDOMAIN and empty responses with a separate negative TTL.
 - Optional prefetching queries upstreams before popular records expire.
@@ -230,7 +231,7 @@ If the HTTP API runs on another host or port, pass `--api http://ip:port` to any
 | `/api/blocking/refresh` | GET, POST | Trigger list downloads |
 | `/api/cache/stats` | GET | Hit count, miss count, and ratio |
 | `/api/cache/clear` | GET, POST | Flush cache entries |
-| `/api/querylog/summary` | GET | Per-client daily counts |
+| `/api/querylog/summary` | GET | Per-client daily counts for today and yesterday (older days are in the CSV files) |
 | `/api/querylog/flush` | GET, POST | Force CSV write |
 | `/api/shutdown` | GET, POST | Trigger clean process exit |
 | `/metrics` | GET | Prometheus scraper endpoint |

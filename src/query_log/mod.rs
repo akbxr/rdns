@@ -1,5 +1,5 @@
 use crate::config::{QueryLogConfig, QueryLogType};
-use parking_lot::RwLock;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs::{create_dir_all, File, OpenOptions};
@@ -18,17 +18,48 @@ pub struct ClientDailyStats {
     pub blocked_queries: u64,
 }
 
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Counts {
+    total: u64,
+    blocked: u64,
+}
+
+#[derive(Debug, Default)]
+struct DayStats {
+    current: Counts,
+    /// What the CSV files hold for this day and client after the last flush.
+    flushed: Counts,
+}
+
+impl DayStats {
+    fn is_dirty(&self) -> bool {
+        self.current != self.flushed
+    }
+}
+
+/// Days since the Unix epoch (UTC).
+type Day = u32;
+
 pub struct QueryLogger {
     config: QueryLogConfig,
-    // (date, client_ip_str) -> (total_queries, blocked_queries)
-    aggregated: RwLock<HashMap<(String, String), (u64, u64)>>,
+    /// (day, client) -> counts. Days that are on disk are dropped after a flush, so the
+    /// map does not grow with every client ever seen.
+    aggregated: Mutex<HashMap<(Day, IpAddr), DayStats>>,
+}
+
+fn today() -> Day {
+    let now_secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    (now_secs / 86400) as Day
 }
 
 impl QueryLogger {
     pub fn new(config: QueryLogConfig) -> Self {
         Self {
             config,
-            aggregated: RwLock::new(HashMap::new()),
+            aggregated: Mutex::new(HashMap::new()),
         }
     }
 
@@ -43,34 +74,25 @@ impl QueryLogger {
             return;
         }
 
-        let now_secs = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        let date_str = epoch_to_date(now_secs);
-        let client_str = client_ip.to_string();
-
-        let mut guard = self.aggregated.write();
-        let entry = guard.entry((date_str, client_str)).or_insert((0, 0));
-        entry.0 += 1;
+        let day = today();
+        let mut guard = self.aggregated.lock();
+        let counts = &mut guard.entry((day, client_ip)).or_default().current;
+        counts.total += 1;
         if is_blocked {
-            entry.1 += 1;
+            counts.blocked += 1;
         }
     }
 
-    /// Returns in-memory summary of daily query counts per client
+    /// Returns in-memory summary of daily query counts per client (today and yesterday;
+    /// older days are in the CSV files)
     pub fn get_summary(&self) -> Vec<ClientDailyStats> {
-        let guard = self.aggregated.read();
-        let mut list = Vec::with_capacity(guard.len());
-        for ((date, client), (total, blocked)) in guard.iter() {
-            list.push(ClientDailyStats {
-                date: date.clone(),
-                client: client.clone(),
-                total_queries: *total,
-                blocked_queries: *blocked,
-            });
-        }
-        list.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| a.client.cmp(&b.client)));
+        let guard = self.aggregated.lock();
+        let mut list: Vec<ClientDailyStats> = guard
+            .iter()
+            .map(|(&(day, client), stats)| to_stats(day, client, stats.current))
+            .collect();
+        drop(guard);
+        sort_stats(&mut list);
         list
     }
 
@@ -85,10 +107,24 @@ impl QueryLogger {
             create_dir_all(target_dir)?;
         }
 
-        let stats = self.get_summary();
-        if stats.is_empty() {
+        // Only what changed since the last flush: the files merge rows with what they hold
+        let dirty: Vec<((Day, IpAddr), Counts)> = self
+            .aggregated
+            .lock()
+            .iter()
+            .filter(|(_, stats)| stats.is_dirty())
+            .map(|(&key, stats)| (key, stats.current))
+            .collect();
+        if dirty.is_empty() {
+            self.prune_flushed_days();
             return Ok(());
         }
+
+        let mut stats: Vec<ClientDailyStats> = dirty
+            .iter()
+            .map(|&((day, client), counts)| to_stats(day, client, counts))
+            .collect();
+        sort_stats(&mut stats);
 
         debug!(dir = ?target_dir, count = stats.len(), "Flushing daily client query stats to CSV");
 
@@ -109,7 +145,25 @@ impl QueryLogger {
             update_csv_file(&client_file_path, &client_stats)?;
         }
 
+        {
+            let mut guard = self.aggregated.lock();
+            for (key, counts) in dirty {
+                if let Some(stats) = guard.get_mut(&key) {
+                    stats.flushed = counts;
+                }
+            }
+        }
+        self.prune_flushed_days();
+
         Ok(())
+    }
+
+    /// Drops days before yesterday whose counts are all on disk.
+    fn prune_flushed_days(&self) {
+        let yesterday = today().saturating_sub(1);
+        self.aggregated
+            .lock()
+            .retain(|&(day, _), stats| day >= yesterday || stats.is_dirty());
     }
 
     /// Start periodic flush task in background
@@ -124,12 +178,29 @@ impl QueryLogger {
 
             loop {
                 interval.tick().await;
-                if let Err(e) = self.flush_to_disk() {
-                    error!("Failed to flush client query log CSV to disk: {e}");
+                // File I/O: keep it off the async workers
+                let logger = self.clone();
+                match tokio::task::spawn_blocking(move || logger.flush_to_disk()).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => error!("Failed to flush client query log CSV to disk: {e}"),
+                    Err(e) => error!("Client query log flush task failed: {e}"),
                 }
             }
         });
     }
+}
+
+fn to_stats(day: Day, client: IpAddr, counts: Counts) -> ClientDailyStats {
+    ClientDailyStats {
+        date: epoch_to_date(u64::from(day) * 86400),
+        client: client.to_string(),
+        total_queries: counts.total,
+        blocked_queries: counts.blocked,
+    }
+}
+
+fn sort_stats(list: &mut [ClientDailyStats]) {
+    list.sort_by(|a, b| b.date.cmp(&a.date).then_with(|| a.client.cmp(&b.client)));
 }
 
 fn update_csv_file(path: &PathBuf, new_stats: &[ClientDailyStats]) -> Result<(), std::io::Error> {
@@ -263,5 +334,34 @@ mod tests {
         // Check per-client file
         let client_file = temp_dir.path().join("192.168.1.50.csv");
         assert!(client_file.exists());
+
+        // Later flushes write only clients that changed, keeping the others' rows
+        std::fs::remove_file(&client_file).unwrap();
+        logger.record(client_b, false);
+        logger.flush_to_disk().unwrap();
+        assert!(!client_file.exists());
+        let content = std::fs::read_to_string(&master_csv).unwrap();
+        assert!(content.contains("192.168.1.50,3,1"));
+        assert!(content.contains("192.168.1.100,2,1"));
+    }
+
+    #[test]
+    fn test_flushed_old_days_are_pruned() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let mut config = QueryLogConfig::default();
+        config.log_type = QueryLogType::CsvClient;
+        config.target_dir = temp_dir.path().to_str().unwrap().to_string();
+        let logger = QueryLogger::new(config);
+
+        let client: IpAddr = "10.0.0.1".parse().unwrap();
+        let old_day = today() - 5;
+        logger.aggregated.lock().entry((old_day, client)).or_default().current = Counts { total: 7, blocked: 2 };
+        logger.record(client, false);
+        assert_eq!(logger.aggregated.lock().len(), 2);
+
+        logger.flush_to_disk().unwrap();
+        assert_eq!(logger.aggregated.lock().len(), 1);
+        let content = std::fs::read_to_string(temp_dir.path().join("clients_daily.csv")).unwrap();
+        assert!(content.contains(&format!("{},10.0.0.1,7,2", epoch_to_date(u64::from(old_day) * 86400))));
     }
 }

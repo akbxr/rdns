@@ -170,9 +170,15 @@ async fn run_server(config_path: PathBuf) -> Result<(), Box<dyn std::error::Erro
         .with_default_directive(default_level.into())
         .from_env_lossy();
 
+    // Log lines go through a background thread: in console mode every query is logged,
+    // and writing to stdout from the async workers made them wait on the terminal or
+    // Docker's log pipe. When the queue is full, lines are dropped rather than slowing
+    // down DNS. The guard flushes the queue when the server exits.
+    let (log_writer, _log_guard) = tracing_appender::non_blocking(std::io::stdout());
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(false)
+        .with_writer(log_writer)
         .init();
 
     info!("Starting rdns v0.1.0...");
@@ -223,6 +229,19 @@ async fn run_server(config_path: PathBuf) -> Result<(), Box<dyn std::error::Erro
             .clone()
             .start_refresh_task(config.blocking.refresh_period);
     }
+    // Drop expired cache entries regularly instead of only when the cache is full
+    if cache.is_enabled() {
+        let cache = cache.clone();
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(60));
+            interval.tick().await;
+            loop {
+                interval.tick().await;
+                cache.purge_expired();
+            }
+        });
+    }
+
     // Start periodic query log CSV flush task
     if query_logger.is_csv_enabled() {
         query_logger

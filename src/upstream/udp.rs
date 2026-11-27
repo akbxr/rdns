@@ -19,6 +19,15 @@ impl UdpResolver {
     }
 
     pub async fn resolve(&self, query: &Message, query_timeout: Duration) -> Result<Message, String> {
+        let bytes = query
+            .to_vec()
+            .map_err(|e| format!("Failed to serialize query: {e}"))?;
+        self.resolve_wire(&bytes, query.metadata.id, query_timeout).await
+    }
+
+    /// A socket per query: its random source port is part of what protects against
+    /// spoofed answers.
+    pub(crate) async fn resolve_wire(&self, bytes: &[u8], id: u16, query_timeout: Duration) -> Result<Message, String> {
         let bind_addr = if self.target.is_ipv6() {
             "[::]:0"
         } else {
@@ -34,13 +43,9 @@ impl UdpResolver {
             .await
             .map_err(|e| format!("Failed to connect to {}: {e}", self.target))?;
 
-        let bytes = query
-            .to_vec()
-            .map_err(|e| format!("Failed to serialize query: {e}"))?;
-
         timeout(query_timeout, async {
             socket
-                .send(&bytes)
+                .send(bytes)
                 .await
                 .map_err(|e| format!("Failed to send query: {e}"))?;
 
@@ -53,10 +58,10 @@ impl UdpResolver {
             let resp = Message::from_vec(&buf[..len])
                 .map_err(|e| format!("Failed to parse response: {e}"))?;
 
-            if resp.metadata.id != query.metadata.id {
+            if resp.metadata.id != id {
                 return Err(format!(
-                    "DNS ID mismatch: expected {}, got {}",
-                    query.metadata.id, resp.metadata.id
+                    "DNS ID mismatch: expected {id}, got {}",
+                    resp.metadata.id
                 ));
             }
 

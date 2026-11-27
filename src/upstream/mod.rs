@@ -1,5 +1,6 @@
 pub mod doh;
 pub mod dot;
+mod pool;
 pub mod tcp;
 pub mod udp;
 
@@ -35,11 +36,19 @@ impl Upstream {
     }
 
     pub async fn resolve(&self, query: &Message, timeout: Duration) -> Result<Message, String> {
+        let wire = query
+            .to_vec()
+            .map_err(|e| format!("Failed to serialize query: {e}"))?;
+        self.resolve_wire(&wire, query.metadata.id, timeout).await
+    }
+
+    /// Resolves an already serialized query with the given ID.
+    async fn resolve_wire(&self, wire: &[u8], id: u16, timeout: Duration) -> Result<Message, String> {
         match self {
-            Self::Udp(u) => u.resolve(query, timeout).await,
-            Self::Tcp(t) => t.resolve(query, timeout).await,
-            Self::Dot(d) => d.resolve(query, timeout).await,
-            Self::Doh(h) => h.resolve(query, timeout).await,
+            Self::Udp(u) => u.resolve_wire(wire, id, timeout).await,
+            Self::Tcp(t) => t.resolve_wire(wire, id, timeout).await,
+            Self::Dot(d) => d.resolve_wire(wire, id, timeout).await,
+            Self::Doh(h) => h.resolve_wire(wire, id, timeout).await,
         }
     }
 
@@ -140,34 +149,39 @@ impl UpstreamGroup {
             return Err(format!("Upstream group '{}' has no upstreams", self.name));
         }
 
+        // Serialize once for all upstreams
+        let wire = query
+            .to_vec()
+            .map_err(|e| format!("Failed to serialize query: {e}"))?;
+        let id = query.metadata.id;
+
         match self.strategy {
-            UpstreamStrategy::Parallel => self.resolve_parallel(query).await,
-            UpstreamStrategy::Strict => self.resolve_strict(query).await,
-            UpstreamStrategy::Random => self.resolve_random(query).await,
+            UpstreamStrategy::Parallel => self.resolve_parallel(&wire, id).await,
+            UpstreamStrategy::Strict => self.resolve_in_order(&wire, id, 0..self.upstreams.len(), "strict").await,
+            UpstreamStrategy::Random => {
+                let mut indices: Vec<usize> = (0..self.upstreams.len()).collect();
+                indices.shuffle(&mut rand::thread_rng());
+                self.resolve_in_order(&wire, id, indices, "random").await
+            }
         }
     }
 
-    async fn resolve_parallel(&self, query: &Message) -> Result<Message, String> {
-        let mut futures = FuturesUnordered::new();
-        for upstream in &self.upstreams {
-            let u = upstream.clone();
-            let q = query.clone();
-            let t = self.timeout;
-            futures.push(async move {
-                let res = u.resolve(&q, t).await;
-                (u.name().to_string(), res)
-            });
-        }
+    async fn resolve_parallel(&self, wire: &[u8], id: u16) -> Result<Message, String> {
+        let mut futures: FuturesUnordered<_> = self
+            .upstreams
+            .iter()
+            .map(|upstream| async move { (upstream, upstream.resolve_wire(wire, id, self.timeout).await) })
+            .collect();
 
         let mut last_error = String::new();
-        while let Some((name, res)) = futures.next().await {
+        while let Some((upstream, res)) = futures.next().await {
             match res {
                 Ok(msg) => {
-                    debug!(upstream = %name, "Upstream answered query in parallel race");
+                    debug!(upstream = %upstream.name(), "Upstream answered query in parallel race");
                     return Ok(msg);
                 }
                 Err(err) => {
-                    warn!(upstream = %name, error = %err, "Upstream failed in parallel race");
+                    warn!(upstream = %upstream.name(), error = %err, "Upstream failed in parallel race");
                     last_error = err;
                 }
             }
@@ -179,40 +193,26 @@ impl UpstreamGroup {
         ))
     }
 
-    async fn resolve_strict(&self, query: &Message) -> Result<Message, String> {
+    async fn resolve_in_order(
+        &self,
+        wire: &[u8],
+        id: u16,
+        order: impl IntoIterator<Item = usize>,
+        strategy: &str,
+    ) -> Result<Message, String> {
         let mut last_error = String::new();
-        for upstream in &self.upstreams {
-            match upstream.resolve(query, self.timeout).await {
-                Ok(msg) => return Ok(msg),
-                Err(err) => {
-                    warn!(upstream = %upstream.name(), error = %err, "Upstream failed in strict sequence");
-                    last_error = err;
-                }
-            }
-        }
-        Err(format!(
-            "All strict upstreams in group '{}' failed. Last error: {last_error}",
-            self.name
-        ))
-    }
-
-    async fn resolve_random(&self, query: &Message) -> Result<Message, String> {
-        let mut indices: Vec<usize> = (0..self.upstreams.len()).collect();
-        indices.shuffle(&mut rand::thread_rng());
-
-        let mut last_error = String::new();
-        for idx in indices {
+        for idx in order {
             let upstream = &self.upstreams[idx];
-            match upstream.resolve(query, self.timeout).await {
+            match upstream.resolve_wire(wire, id, self.timeout).await {
                 Ok(msg) => return Ok(msg),
                 Err(err) => {
-                    warn!(upstream = %upstream.name(), error = %err, "Upstream failed in random sequence");
+                    warn!(upstream = %upstream.name(), error = %err, "Upstream failed in {strategy} sequence");
                     last_error = err;
                 }
             }
         }
         Err(format!(
-            "All random upstreams in group '{}' failed. Last error: {last_error}",
+            "All {strategy} upstreams in group '{}' failed. Last error: {last_error}",
             self.name
         ))
     }
@@ -292,9 +292,20 @@ impl UpstreamRegistry {
 
     /// Match domain against conditional forwarding rules
     pub fn get_for_domain(&self, domain: &str) -> Option<&UpstreamGroup> {
-        let norm_domain = domain.trim().trim_end_matches('.').to_lowercase();
+        if self.conditional_domains.is_empty() {
+            return None;
+        }
+        let trimmed = domain.trim().trim_end_matches('.');
+        let norm_domain: std::borrow::Cow<str> = if trimmed.bytes().any(|b| b.is_ascii_uppercase() || !b.is_ascii()) {
+            trimmed.to_lowercase().into()
+        } else {
+            trimmed.into()
+        };
         for (cond_domain, group_name) in &self.conditional_domains {
-            if norm_domain == *cond_domain || norm_domain.ends_with(&format!(".{cond_domain}")) {
+            let matches = norm_domain
+                .strip_suffix(cond_domain.as_str())
+                .is_some_and(|rest| rest.is_empty() || rest.ends_with('.'));
+            if matches {
                 if let Some(grp) = self.groups.get(group_name) {
                     return Some(grp);
                 }
@@ -342,6 +353,8 @@ mod tests {
             "lan"
         );
         assert!(reg.get_for_domain("1.1.168.192.in-addr.arpa").is_some());
+        assert!(reg.get_for_domain("Home.LAN.").is_some());
         assert!(reg.get_for_domain("google.com").is_none());
+        assert!(reg.get_for_domain("myhome.lan").is_none());
     }
 }
